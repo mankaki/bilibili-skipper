@@ -1,26 +1,35 @@
 // ==UserScript==
-// @name         B站自动跳片头片尾
+// @name         B站自动跳片头片尾 (终极重构版)
 // @namespace    http://tampermonkey.net/
-// @version      1.7
-// @description  支持设置自定义片头片尾，播放时自动跳转
-// @author       mankaki
+// @version      2.0
+// @description  支持设置自定义片头片尾，播放时自动跳转，多路并发防冲突
+// @author       mankaki (modified)
 // @match        *://www.bilibili.com/video/*
+// @match        *://www.bilibili.com/bangumi/play/*
+// @match        *://www.bilibili.com/list/*
 // @icon         https://www.bilibili.com/favicon.ico
 // @grant        none
 // @license      GPL-3.0
 // ==/UserScript==
 
-(function() {
+(function () {
   'use strict';
 
   const KEY_HEAD = 'bili_skip_head';
   const KEY_TAIL = 'bili_skip_tail';
   const KEY_ENABLED = 'bili_skip_enabled';
 
-  let headSec = parseFloat(localStorage.getItem(KEY_HEAD)) || null;
-  let tailSec = parseFloat(localStorage.getItem(KEY_TAIL)) || null;
+  // 修复因为 0 导致的 || 短路问题
+  function getNumberFromStorage(key) {
+    const val = localStorage.getItem(key);
+    if (val === null || val === '') return null;
+    const parsed = parseFloat(val);
+    return isNaN(parsed) ? null : parsed;
+  }
+
+  let headSec = getNumberFromStorage(KEY_HEAD);
+  let tailSec = getNumberFromStorage(KEY_TAIL);
   let enabled = localStorage.getItem(KEY_ENABLED) === 'true';
-  let hasJumpedToTail = false; // 标志变量，记录是否已跳转到片尾
 
   // 创建浮窗
   const infoDiv = document.createElement('div');
@@ -28,8 +37,8 @@
     position: 'fixed', bottom: '80px', right: '20px',
     padding: '8px 12px', background: 'rgba(0,0,0,0.7)',
     color: '#fff', fontSize: '14px', borderRadius: '4px',
-    zIndex: 9999, fontFamily: 'sans-serif',
-    opacity: 0, display: 'none', transition: 'opacity 0.5s'
+    zIndex: 999999, fontFamily: 'sans-serif',
+    opacity: 0, pointerEvents: 'none', transition: 'opacity 0.5s'
   });
   document.body.appendChild(infoDiv);
 
@@ -38,94 +47,116 @@
     const head = headSec !== null ? formatTime(headSec) : '—';
     const tail = tailSec !== null ? formatTime(tailSec) : '—';
     const status = enabled ? '✅ 开启' : '❌ 关闭';
-    infoDiv.textContent = `片头: ${head}  片尾: ${tail}  状态: ${status}`;
-    infoDiv.style.display = 'block';
+
+    // 【重要改进】动态挂载 DOM，确保在 B 站进入真实的浏览器全屏（兼容 Safari）时依然能看到它
+    const targetContainer = document.fullscreenElement || document.webkitFullscreenElement || document.body;
+    if (infoDiv.parentNode !== targetContainer) {
+      targetContainer.appendChild(infoDiv);
+    }
+
+    infoDiv.textContent = `片头: ${head}  片尾时长: ${tail}  状态: ${status}`;
     infoDiv.style.opacity = '1';
+
     if (hideTimer) clearTimeout(hideTimer);
-    hideTimer = setTimeout(() => {
-      infoDiv.style.opacity = '0';
-      setTimeout(() => infoDiv.style.display = 'none', 500);
-    }, 3000);
+    hideTimer = setTimeout(() => infoDiv.style.opacity = '0', 3000);
   }
 
   function formatTime(sec) {
+    if (sec < 0) return '00:00';
     const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = Math.floor(sec % 60);
     return (h > 0 ? h + ':' : '') + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
   }
 
   function parseTime(str) {
-    if (!str) return null;
+    if (!str || str.trim() === '') return null;
+    const normalizedStr = str.replace(/：/g, ':').trim(); // 兼容中文全角冒号
     let sec = 0;
-    if (str.includes(':')) {
-      const p = str.split(':').map(Number).reverse();
+    if (normalizedStr.includes(':')) {
+      const p = normalizedStr.split(':').map(Number).reverse();
       sec = (p[0] || 0) + (p[1] || 0) * 60 + (p[2] || 0) * 3600;
-    } else sec = parseFloat(str);
+    } else {
+      sec = parseFloat(normalizedStr);
+    }
     return isNaN(sec) ? null : sec;
   }
 
-  // 设置片头/尾
   function setTimes() {
-    let h = prompt('设置片头时间（mm:ss 或 秒数，不跳请留空）:', headSec !== null ? formatTime(headSec) : '');
-    let t = prompt('设置片尾时间（mm:ss 或 秒数，不跳请留空）:', tailSec !== null ? formatTime(tailSec) : '');
-    const hSec = parseTime(h);
-    const tSec = parseTime(t);
-    if ((h && hSec === null) && (t && tSec === null)) return alert('至少设置一个有效时间');
-    headSec = hSec;
-    tailSec = tSec;
+    let h = prompt('设置片头时间 (格式 mm:ss 或秒数，不跳请留空):', headSec !== null ? formatTime(headSec) : '');
+    if (h === null) return;
+
+    let t = prompt('设置片尾时长 (格式 mm:ss 或秒数，表示跳最后多少时间):', tailSec !== null ? formatTime(tailSec) : '');
+    if (t === null) return;
+
+    headSec = parseTime(h);
+    tailSec = parseTime(t);
+
+    if (headSec === null && tailSec === null) {
+      enabled = false;
+    } else {
+      enabled = true;
+    }
+
     localStorage.setItem(KEY_HEAD, headSec === null ? '' : headSec);
     localStorage.setItem(KEY_TAIL, tailSec === null ? '' : tailSec);
-    enabled = true;
-    localStorage.setItem(KEY_ENABLED, 'true');
+    localStorage.setItem(KEY_ENABLED, enabled);
+
+    // 配置更新后，清空页面上曾产生过的所有跳跃标志（为了能够即时生效）
+    document.querySelectorAll('video').forEach(v => v.dataset.biliSkipTail = '');
+
     showInfo();
   }
 
-  // 监控播放跳转片头/尾
-  function monitor(video) {
-    video.addEventListener('timeupdate', () => {
-      if (!enabled) return;
-      const currentTime = video.currentTime;
-      const duration = video.duration;
+  document.addEventListener('timeupdate', (e) => {
+    const video = e.target;
+    if (!enabled || video.tagName !== 'VIDEO') return;
 
-      if (headSec !== null && currentTime < headSec) {
-        video.currentTime = headSec;
-      } else if (tailSec !== null && duration - currentTime <= tailSec) {
-        // 在片尾时间段内，跳转到视频的最后一秒，仅跳转一次
-        if (!hasJumpedToTail) {
-          video.currentTime = duration - 1;
-          hasJumpedToTail = true;
-        }
-      } else {
-        // 重置标志变量，以便下次进入片尾时间段时可以跳转
-        hasJumpedToTail = false;
+    // 用精确的容器查询代替宽度判断，完美兼容原生画中画模式和后台运行
+    if (!video.closest('.bpx-player-container, #bilibili-player, #bofqi')) return;
+
+    if (isNaN(video.duration)) return;
+    const currentTime = video.currentTime;
+    const duration = video.duration;
+
+    if (headSec !== null && currentTime < headSec) {
+      video.currentTime = headSec;
+    } else if (tailSec !== null && (duration - currentTime) <= tailSec) {
+      // 把“是否跳过”作为标记挂接在各自所属的那个 video 身上！
+      if (!video.dataset.biliSkipTail) {
+        // 退一步海阔天空，不跳到最后死角，给B站组件加载下集模块的空间
+        video.currentTime = Math.max(video.currentTime, duration - 1);
+        video.dataset.biliSkipTail = 'true';
       }
-    });
-  }
+    } else {
+      video.dataset.biliSkipTail = '';
+    }
+  }, true);
 
   document.addEventListener('keydown', e => {
-    const tag = document.activeElement.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-    // Shift + M 设置片头片尾时间
-    if (e.key.toLowerCase() === 'm' && e.shiftKey) {
+    // 穿透 B站 新版 Web Components(Shadow DOM) 获取真实的输入焦点
+    let el = document.activeElement;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+      el = el.shadowRoot.activeElement;
+    }
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+
+    // 获取修饰键状态，防止误杀系统/浏览器级快捷键（比如 Ctrl+O 开文件、Cmd+M 窗口最小化）
+    const hasModifier = e.ctrlKey || e.metaKey || e.altKey;
+
+    if (e.key.toLowerCase() === 'm' && e.shiftKey && !hasModifier) {
       e.preventDefault();
+      e.stopPropagation(); // 阻止事件冒泡，防止被 B站 内部的快捷键拦截器吞噬
       setTimes();
     }
-    // O 键开启/关闭功能
-    if (e.key.toLowerCase() === 'o') {
+    
+    // 只在纯按 'o' 时触发，如果是 Shift+O 等也排除掉
+    if (e.key.toLowerCase() === 'o' && !e.shiftKey && !hasModifier) {
       e.preventDefault();
+      e.stopPropagation();
       enabled = !enabled;
-      localStorage.setItem(KEY_ENABLED, enabled ? 'true' : 'false');
+      localStorage.setItem(KEY_ENABLED, enabled);
       showInfo();
     }
-  });
+  }, true); // ★ 挂载在捕获阶段，第一时间拦截用户的按键动作
 
-  // 初次加载进来，显示一次浮窗
   showInfo();
-  const video = document.querySelector('video');
-  if (video) monitor(video);
-  else {
-    new MutationObserver((_, obs) => {
-      const v = document.querySelector('video');
-      if (v) { monitor(v); obs.disconnect(); }
-    }).observe(document.body, { childList: true, subtree: true });
-  }
 })();
