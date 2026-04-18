@@ -9,6 +9,7 @@
 // @match        *://www.bilibili.com/list/*
 // @icon         https://www.bilibili.com/favicon.ico
 // @grant        none
+// @run-at       document-start
 // @license      GPL-3.0
 // ==/UserScript==
 
@@ -40,19 +41,25 @@
     zIndex: 999999, fontFamily: 'sans-serif',
     opacity: 0, pointerEvents: 'none', transition: 'opacity 0.5s'
   });
-  document.body.appendChild(infoDiv);
 
   let hideTimer = null;
+
+  function getOverlayContainer() {
+    return document.fullscreenElement || document.webkitFullscreenElement || document.body || document.documentElement;
+  }
+
+  function ensureInfoDivMounted() {
+    const targetContainer = getOverlayContainer();
+    if (!targetContainer || infoDiv.parentNode === targetContainer) return;
+    targetContainer.appendChild(infoDiv);
+  }
+
   function showInfo() {
     const head = headSec !== null ? formatTime(headSec) : '—';
     const tail = tailSec !== null ? formatTime(tailSec) : '—';
     const status = enabled ? '✅ 开启' : '❌ 关闭';
 
-    // 【重要改进】动态挂载 DOM，确保在 B 站进入真实的浏览器全屏（兼容 Safari）时依然能看到它
-    const targetContainer = document.fullscreenElement || document.webkitFullscreenElement || document.body;
-    if (infoDiv.parentNode !== targetContainer) {
-      targetContainer.appendChild(infoDiv);
-    }
+    ensureInfoDivMounted();
 
     infoDiv.textContent = `片头: ${head}  片尾时长: ${tail}  状态: ${status}`;
     infoDiv.style.opacity = '1';
@@ -80,6 +87,17 @@
     return isNaN(sec) ? null : sec;
   }
 
+  function clearTailSkipMarkers() {
+    document.querySelectorAll('video[data-bili-skip-bound="true"]').forEach((video) => {
+      video.dataset.biliSkipTail = '';
+    });
+    shadowHostObservers.forEach((entry) => {
+      entry.host.shadowRoot?.querySelectorAll('video[data-bili-skip-bound="true"]').forEach((video) => {
+        video.dataset.biliSkipTail = '';
+      });
+    });
+  }
+
   function setTimes() {
     let h = prompt('设置片头时间 (格式 mm:ss 或秒数，不跳请留空):', headSec !== null ? formatTime(headSec) : '');
     if (h === null) return;
@@ -100,18 +118,31 @@
     localStorage.setItem(KEY_TAIL, tailSec === null ? '' : tailSec);
     localStorage.setItem(KEY_ENABLED, enabled);
 
-    // 配置更新后，清空页面上曾产生过的所有跳跃标志（为了能够即时生效）
-    document.querySelectorAll('video').forEach(v => v.dataset.biliSkipTail = '');
+    clearTailSkipMarkers();
 
     showInfo();
   }
 
-  document.addEventListener('timeupdate', (e) => {
-    const video = e.target;
-    if (!enabled || video.tagName !== 'VIDEO') return;
+  function closestCrossShadow(element, selector) {
+    let current = element;
+    while (current) {
+      if (current instanceof Element) {
+        const match = current.closest(selector);
+        if (match) return match;
+        const root = current.getRootNode();
+        current = root instanceof ShadowRoot ? root.host : null;
+      } else {
+        current = null;
+      }
+    }
+    return null;
+  }
 
-    // 用精确的容器查询代替宽度判断，完美兼容原生画中画模式和后台运行
-    if (!video.closest('.bpx-player-container, #bilibili-player, #bofqi')) return;
+  function handleVideoTimeUpdate(video) {
+    if (!enabled) return;
+    if (!video || video.tagName !== 'VIDEO') return;
+
+    if (!closestCrossShadow(video, '.bpx-player-container, #bilibili-player, #bofqi')) return;
 
     if (isNaN(video.duration)) return;
     const currentTime = video.currentTime;
@@ -120,16 +151,130 @@
     if (headSec !== null && currentTime < headSec) {
       video.currentTime = headSec;
     } else if (tailSec !== null && (duration - currentTime) <= tailSec) {
-      // 把“是否跳过”作为标记挂接在各自所属的那个 video 身上！
       if (!video.dataset.biliSkipTail) {
-        // 退一步海阔天空，不跳到最后死角，给B站组件加载下集模块的空间
         video.currentTime = Math.max(video.currentTime, duration - 1);
         video.dataset.biliSkipTail = 'true';
       }
     } else {
       video.dataset.biliSkipTail = '';
     }
-  }, true);
+  }
+
+  function bindVideo(video) {
+    if (!video || video.dataset.biliSkipBound === 'true') return;
+    video.dataset.biliSkipBound = 'true';
+    video.addEventListener('timeupdate', () => handleVideoTimeUpdate(video));
+  }
+
+  function inspectElement(element) {
+    if (element.tagName === 'VIDEO') {
+      bindVideo(element);
+    }
+    if (element.shadowRoot) {
+      observeShadowHost(element);
+    }
+  }
+
+  function scanSubtree(root) {
+    if (!root) return;
+    if (root instanceof Element) {
+      inspectElement(root);
+    }
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    while (walker.nextNode()) {
+      inspectElement(walker.currentNode);
+    }
+  }
+
+  const shadowHostObservers = new Map();
+
+  function disconnectShadowHost(host) {
+    const entry = shadowHostObservers.get(host);
+    if (!entry) return;
+    entry.observer.disconnect();
+    shadowHostObservers.delete(host);
+  }
+
+  function cleanupShadowHostObservers() {
+    shadowHostObservers.forEach((_, host) => {
+      if (!host.isConnected) {
+        disconnectShadowHost(host);
+      }
+    });
+  }
+
+  function disconnectShadowHostsInSubtree(root) {
+    if (!(root instanceof Element)) return;
+    disconnectShadowHost(root);
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    while (walker.nextNode()) {
+      disconnectShadowHost(walker.currentNode);
+    }
+  }
+
+  function scanAddedNodes(nodes) {
+    const elements = [];
+    nodes.forEach((node) => {
+      if (node instanceof Element) {
+        elements.push(node);
+      }
+    });
+    const elementSet = new Set(elements);
+    elements.forEach((element) => {
+      let ancestor = element.parentElement;
+      while (ancestor) {
+        if (elementSet.has(ancestor)) return;
+        ancestor = ancestor.parentElement;
+      }
+      scanSubtree(element);
+    });
+  }
+
+  function observeShadowHost(host) {
+    if (!host || !host.shadowRoot || shadowHostObservers.has(host)) return;
+    const observer = new MutationObserver((mutations) => {
+      cleanupShadowHostObservers();
+      const addedNodes = [];
+      mutations.forEach((mutation) => {
+        mutation.removedNodes.forEach(disconnectShadowHostsInSubtree);
+        mutation.addedNodes.forEach((node) => addedNodes.push(node));
+      });
+      scanAddedNodes(addedNodes);
+    });
+    observer.observe(host.shadowRoot, { childList: true, subtree: true });
+    shadowHostObservers.set(host, { observer, host });
+    scanSubtree(host.shadowRoot);
+  }
+
+  const originalAttachShadow = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function (init) {
+    const shadowRoot = originalAttachShadow.call(this, init);
+    observeShadowHost(this);
+    return shadowRoot;
+  };
+
+  const documentObserver = new MutationObserver((mutations) => {
+    cleanupShadowHostObservers();
+    const addedNodes = [];
+    mutations.forEach((mutation) => {
+      mutation.removedNodes.forEach(disconnectShadowHostsInSubtree);
+      mutation.addedNodes.forEach((node) => addedNodes.push(node));
+    });
+    scanAddedNodes(addedNodes);
+  });
+
+  function startObservers() {
+    scanSubtree(document);
+    if (document.documentElement) {
+      documentObserver.observe(document.documentElement, { childList: true, subtree: true });
+    }
+  }
+
+  if (document.documentElement) {
+    startObservers();
+  } else {
+    document.addEventListener('DOMContentLoaded', startObservers, { once: true });
+  }
 
   document.addEventListener('keydown', e => {
     // 穿透 B站 新版 Web Components(Shadow DOM) 获取真实的输入焦点
