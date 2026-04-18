@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站自动跳片头片尾 (终极重构版)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  支持设置自定义片头片尾，播放时自动跳转，多路并发防冲突
 // @author       mankaki (modified)
 // @match        *://www.bilibili.com/video/*
